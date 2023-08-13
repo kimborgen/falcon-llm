@@ -22,6 +22,9 @@ def main():
     falcon_config = RWConfig.from_pretrained(pretrained_config_path)
     # Downloads model weights from HF repo and instanties a model from the local modelling_RW.py
     # TODO Download a specified checkpoint/commit OR download latest pre trained config from HF
+    assert falcon_config.alibi == False
+    falcon_config.alibi = True
+
     model = RWForCausalLM.from_pretrained(
         model_name,
         config=falcon_config,
@@ -35,8 +38,8 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     print(f"Pre-trained tokenizer: {tokenizer}")
     
-    #simpleinput(model, tokenizer)
-    simplepipe(model,tokenizer)
+    simpleinput(model, tokenizer)
+    #simplepipe(model,tokenizer)
 
 def simpleinput(model, tokenizer):
     inputs = tokenizer("What's the best way to divide a pizza between three people?", return_token_type_ids=False, return_tensors="pt").to("cuda")
@@ -53,6 +56,9 @@ def simpleinput(model, tokenizer):
     ... repeating
     """
     # So this is garbage, but the simplepipe is ok, why
+    """ With Alibi:
+    Garbage
+    """
 
 
 def simplepipe(model, tokenizer):
@@ -76,6 +82,10 @@ def simplepipe(model, tokenizer):
     One wrote: "The best way to split a pizza is with a ruler, you know you have the right amount of each bit."
     """ 
     # much better than simpleinput, is it because of sampling and top-k perhaps?
+
+    """ With alibi:
+    Result: What's the best way to divide a pizza between three people? Is it? What is your free The? You should be the online НУХвУУУШУєїъїУњћћУУљћњњУУћѡ, ѕѣћљёїёїёВ?јѡїЗљХёѣѣ?ї?ѕѥїїњ?ѥ? ї?ї?їў?ХХ?Х?Х?ѥ?Х? їХ?ѥ?Х?Х?￥?ў?Х?Х?У? ѥ
+    """
     
     giff = "Girafatron is obsessed with giraffes, the most glorious animal on the face of this Earth. Giraftron believes all other animals are irrelevant when compared to the glorious majesty of the giraffe.\nDaniel: Hello, Girafatron!\nGirafatron:"
     """
@@ -92,8 +102,28 @@ def simplepipe(model, tokenizer):
     Girafatron: Not at all! Just think of it! All giraffes! And all the giraffe things! It would be the
     """
 
+    """ With alibi:
+    Result: Girafatron is obsessed with giraffes, the most glorious animal on the face of this Earth. Giraftron believes all other animals are irrelevant when compared to the glorious majesty of the giraffe.
+    Daniel: Hello, Girafatron!
+    Girafatron: - -
+    - - -
+    -
+    - - 1 - - - 1- 0
+    - - 0- 0 0
+    - 0
+    - -
+    - "
+    -
+    - "The new, 0
+    - "I was 0: " (I''m
+    "'s a
+    0.'m'0. 0,0', '0, " 0', "0, and,,
+    -, ',,
+    -, ',
+    """
+
     sequences = pl(
-        pizza,
+        giff,
         max_length=200,
         do_sample=True,
         top_k=10,
