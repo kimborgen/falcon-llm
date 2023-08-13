@@ -76,7 +76,7 @@ def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torc
     return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
 
 
-class Attention(nn.Module):
+class AttentionAlibi(nn.Module):
     def __init__(self, config: RWConfig):
         super().__init__()
 
@@ -512,7 +512,7 @@ class RWModel(RWPreTrainedModel):
         )
 
 
-class RWForCausalLM(RWPreTrainedModel):
+class FalconAlibiForCausalLM(RWPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
     def __init__(self, config: RWConfig):

@@ -1,5 +1,7 @@
 from configuration_RW import RWConfig
-from modelling_RW import RWForCausalLM
+#from modelling_RW import RWForCausalLM
+from model_rotary import FalconRotaryForCausalLM
+from model_alibi import FalconAlibiForCausalLM
 
 from transformers import (
     AutoModelForCausalLM,
@@ -11,6 +13,29 @@ from transformers.utils import logging
 
 import torch
 
+
+def load_falcon_rotary(falcon_config, model_name):
+    model = FalconRotaryForCausalLM.from_pretrained(
+        model_name,
+        config=falcon_config,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+    )
+    print(f"Pretrained falcon model with Rotary: {model}")
+    return model
+
+def load_falcon_alibi(falcon_config, model_name):
+    model = FalconAlibiForCausalLM.from_pretrained(
+        model_name,
+        config=falcon_config,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+    )
+    print(f"Pretrained falcon model with Alibi: {model}")
+    return model
+
 def main():
     logging.set_verbosity_info()
 
@@ -20,16 +45,11 @@ def main():
 
     # Get local config.json, same as from HF. 
     falcon_config = RWConfig.from_pretrained(pretrained_config_path)
-    # Downloads model weights from HF repo and instanties a model from the local modelling_RW.py
+    
+    # Downloads model weights from HF repo and instanties a model from the local classes
     # TODO Download a specified checkpoint/commit OR download latest pre trained config from HF
-    model = RWForCausalLM.from_pretrained(
-        model_name,
-        config=falcon_config,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        device_map="auto",
-    )
-    print(f"Pretrained falcon model: {model}")
+    model = load_falcon_rotary(falcon_config, model_name)
+    #model = load_falcon_alibi(falcon_config, model_name)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
