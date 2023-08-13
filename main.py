@@ -1,5 +1,5 @@
-from modelling_RW import RWConfig
-from configuration_RW import RWForCausalLM
+from configuration_RW import RWConfig
+from modelling_RW import RWForCausalLM
 
 from transformers import (
     AutoModelForCausalLM,
@@ -14,12 +14,15 @@ def main():
     logging.set_verbosity_info()
 
     # Loading local config, model, and tokenizer classes with pretrained configs, is this the correct way to do it?
-    pretrained_config_path = "falcon7b-pretrained-configs/config.json"
-    falcon_config = RWConfig.from_pretrained(pretrained_config_path)
-    print(f"Pre-trained falcon-7b config: {falcon_config}")
+    pretrained_config_path = "./falcon7b-pretrained-configs/config.json"
+    model_name = "tiiuae/falcon-7b"
 
+    # Get local config.json, same as from HF. 
+    falcon_config = RWConfig.from_pretrained(pretrained_config_path)
+    # Downloads model weights from HF repo and instanties a model from the local modelling_RW.py
+    # TODO Download a specified checkpoint/commit OR download latest pre trained config from HF
     falcon_model = RWForCausalLM.from_pretrained(
-        pretrained_config_path,
+        model_name,
         config=falcon_config,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
@@ -27,7 +30,7 @@ def main():
     )
     print(f"Pretrained falcon model: {falcon_model}")
 
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_config_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     print(f"Pre-trained tokenizer: {tokenizer}")
 
