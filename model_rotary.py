@@ -93,13 +93,12 @@ class Attention(nn.Module):
                 f" {self.num_heads})."
             )
 
-        self.maybe_rotary = RotaryEmbedding(config.head_dim) if config.rotary else lambda q, k: (q, k)
-        #print(f"\n\nconfig.rotary: {config.rotary} \n\n")
-        # config.rotary is rue
+        assert config.alibi == False
+        self.rotary = RotaryEmbedding(config.head_dim)
 
         # Layer-wise attention scaling
-        self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
-        self.beta = self.inv_norm_factor
+        #self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
+        #self.beta = self.inv_norm_factor
 
         self.query_key_value = Linear(
             self.hidden_size,
@@ -108,7 +107,7 @@ class Attention(nn.Module):
         )
         self.multi_query = config.multi_query
         self.dense = Linear(self.hidden_size, self.hidden_size, bias=config.bias)
-        self.attention_dropout = nn.Dropout(config.attention_dropout)
+        #self.attention_dropout = nn.Dropout(config.attention_dropout)
         self.num_kv = config.n_head if not self.multi_query else 1
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -131,31 +130,6 @@ class Attention(nn.Module):
             batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
             fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
             return fused_qkv[..., :-2, :], fused_qkv[..., [-2], :], fused_qkv[..., [-1], :]
-
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Merge heads together over the last dimenstion
-
-        Args:
-            x: (`torch.tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
-
-        Returns:
-            torch.tensor: [batch_size, seq_length, num_heads * head_dim]
-        """
-        # What we want to achieve is:
-        # batch_size * num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads * head_dim
-        batch_size_and_num_heads, seq_length, _ = x.shape
-        batch_size = batch_size_and_num_heads // self.num_heads
-
-        # First view to decompose the batch size
-        # batch_size * num_heads, seq_length, head_dim -> batch_size, num_heads, seq_length, head_dim
-        x = x.view(batch_size, self.num_heads, seq_length, self.head_dim)
-
-        # batch_size, num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads, head_dim
-        x = x.permute(0, 2, 1, 3)
-
-        # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
-        return x.reshape(batch_size, seq_length, self.num_heads * self.head_dim)
 
     def forward(
         self,
@@ -199,64 +173,24 @@ class Attention(nn.Module):
         else:
             present = None
 
-        if alibi is None:
-            query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
-            key_layer_ = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
-            value_layer_ = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+        query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
+        key_layer_ = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+        value_layer_ = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
 
-            attn_output = F.scaled_dot_product_attention(
-                query_layer_, key_layer_, value_layer_, None, 0.0, is_causal=True
-            )
+        attn_output = F.scaled_dot_product_attention(
+            query_layer_, key_layer_, value_layer_, None, 0.0, is_causal=True
+        )
 
-            x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
-            x = x.permute(0, 2, 1, 3)
-            attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
+        x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
+        x = x.permute(0, 2, 1, 3)
+        attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
 
-            output_tensor = self.dense(attn_output)
+        output_tensor = self.dense(attn_output)
 
-            outputs = (output_tensor, present)
-            assert not output_attentions  # not supported.
-            return outputs
-        else:
-            attention_mask_float = (attention_mask * 1.0).masked_fill(attention_mask, -1e9).to(torch.bfloat16)
-            matmul_result = query_layer @ key_layer.transpose(-1, -2)
-
-            # change view to [batch_size, num_heads, q_length, kv_length]
-            attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
-
-            # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
-            input_dtype = attention_scores.dtype
-            # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
-            if input_dtype == torch.float16 or input_dtype == torch.bfloat16:
-                attention_scores = attention_scores.to(torch.float32)
-            # attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
-            attention_probs = F.softmax(
-                (attention_scores + alibi.view(batch_size, self.num_heads, 1, -1)) * self.inv_norm_factor + attention_mask_float,
-                dim=-1,
-                dtype=hidden_states.dtype,
-            )
-            # [batch_size, num_heads, q_length, kv_length]
-            attention_probs = self.attention_dropout(attention_probs)
-
-            if head_mask is not None:
-                attention_probs = attention_probs * head_mask
-
-            # change view [batch_size x num_heads, q_length, kv_length]
-            attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
-
-            # matmul: [batch_size * num_heads, q_length, head_dim]
-            context_layer = attention_probs_reshaped @ value_layer
-
-            # change view [batch_size, num_heads, q_length, head_dim]
-            context_layer = self._merge_heads(context_layer)
-
-            output_tensor = self.dense(context_layer)
-
-            outputs = (output_tensor, present)
-            if output_attentions:
-                outputs += (attention_probs,)
-
-            return outputs
+        outputs = (output_tensor, present)
+        assert not output_attentions  # not supported.
+        return outputs
+    
 
 class DecoderLayer(nn.Module):
     def __init__(self, config: RWConfig):
