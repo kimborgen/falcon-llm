@@ -219,10 +219,6 @@ class DecoderLayer(nn.Module):
         self.num_heads = config.n_head
         self.self_attention = AttentionRotary(config)
 
-        if not config.parallel_attn:
-            # unused if parallel attn
-            self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-
         self.mlp = MLP(config)
 
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
@@ -248,20 +244,14 @@ class DecoderLayer(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
         )
-
         attention_output = attn_outputs[0]
-
-        if not self.config.parallel_attn:
-            residual = dropout_add(attention_output, residual, self.config.attention_dropout, training=self.training)
-            layernorm_output = self.post_attention_layernorm(residual)
 
         outputs = attn_outputs[1:]
 
         # MLP.
         mlp_output = self.mlp(layernorm_output)
-
-        if self.config.parallel_attn:
-            mlp_output += attention_output
+        
+        mlp_output += attention_output
 
         output = dropout_add(mlp_output, residual, self.config.hidden_dropout, training=self.training)
 
