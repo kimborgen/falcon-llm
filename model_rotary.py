@@ -148,7 +148,7 @@ class AttentionRotary(nn.Module):
         )
         value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_kv, q_length, self.head_dim)
 
-        query_layer, key_layer = self.maybe_rotary(query_layer, key_layer)
+        query_layer, key_layer = self.rotary(query_layer, key_layer)
 
         if layer_past is not None:
             past_key, past_value = layer_past
@@ -426,6 +426,7 @@ class FalconRotaryForCausalLM(RWPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        attention_mask: Optional[torch.Tensor] = None, # have to include it for the HF pipeline to work
         **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]:
         r"""
