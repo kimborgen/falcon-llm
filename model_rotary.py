@@ -115,7 +115,7 @@ class AttentionRotary(nn.Module):
         self.num_heads = config.n_head
         self.head_dim = self.hidden_size // self.num_heads
         self.split_size = self.hidden_size
-        self.hidden_dropout = config.hidden_dropout
+        #self.hidden_dropout = config.hidden_dropout
 
         if self.head_dim * self.num_heads != self.hidden_size:
             raise ValueError(
@@ -163,53 +163,50 @@ class AttentionRotary(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
     ):
+
+        # Transform hidden states to a fused QKV tensor
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
+        
+        # Split the fused tensor into separate Q, K, V tensors and organize for multi-head attention
+        query_layer, key_layer, value_layer = self._split_heads(fused_qkv)  # [batch_size, seq_length, num_heads, head_dim]
 
-        # 3 x [batch_size, seq_length, num_heads, head_dim]
-        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
-
+        # Reshape Q, K, V for compatibility with RotaryEmbeddings
         batch_size, q_length, _, _ = query_layer.shape
-
         query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
-        key_layer = key_layer.transpose(1, 2).reshape(
-            batch_size * self.num_kv,
-            q_length,
-            self.head_dim,
-        )
+        key_layer = key_layer.transpose(1, 2).reshape(batch_size * self.num_kv, q_length, self.head_dim)
         value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_kv, q_length, self.head_dim)
-
+        
+        # Apply Rotary embeddings
         query_layer, key_layer = self.rotary(query_layer, key_layer)
-
+        
+        # If there's a past layer (like in transformer decoding), use it.
         if layer_past is not None:
             past_key, past_value = layer_past
-            # concatenate along seq_length dimension:
-            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
-            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
             key_layer = torch.cat((past_key, key_layer), dim=1)
             value_layer = torch.cat((past_value, value_layer), dim=1)
+        
+        # Cache mechanism for Transformer decoding
+        present = (key_layer, value_layer) if use_cache else None
 
-        if use_cache is True:
-            present = (key_layer, value_layer)
-        else:
-            present = None
+        # Reshape for scaled dot-product attention
+        query_layer = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
+        key_layer = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+        value_layer = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
 
-        query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
-        key_layer_ = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
-        value_layer_ = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
-
+        # Compute the scaled dot-product attention
         attn_output = F.scaled_dot_product_attention(
-            query_layer_, key_layer_, value_layer_, None, 0.0, is_causal=True
+            query_layer, key_layer, value_layer, attn_mask=None, dropout_p=0.0, is_causal=True
         )
 
-        x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
-        x = x.permute(0, 2, 1, 3)
-        attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
-
+        # Reshape and transpose to match expected dimensions: [batch_size, seq_length, num_heads * head_dim]
+        attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, q_length, -1)
+        
+        # Transform the attention output through a dense layer
         output_tensor = self.dense(attn_output)
-
+        
         outputs = (output_tensor, present)
-        #self.attention_dropout = nn.Dropout(config.attention_dropout)
-        assert not output_attentions  # not supported.
+        assert not output_attentions  # Not supported in this version
+
         return outputs
     
 

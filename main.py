@@ -1,7 +1,7 @@
 from configuration_RW import RWConfig
 #from modelling_RW import RWForCausalLM
 from model_rotary import FalconRotaryForCausalLM
-from model_alibi import FalconAlibiForCausalLM
+
 
 from transformers import (
     AutoModelForCausalLM,
@@ -49,7 +49,6 @@ def main():
     # Downloads model weights from HF repo and instanties a model from the local classes
     # TODO Download a specified checkpoint/commit OR download latest pre trained config from HF
     model = load_falcon_rotary(falcon_config, model_name)
-    #model = load_falcon_alibi(falcon_config, model_name)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
