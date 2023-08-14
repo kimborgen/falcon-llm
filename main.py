@@ -1,5 +1,7 @@
 from configuration_RW import RWConfig
-from modelling_RW import RWForCausalLM
+#from modelling_RW import RWForCausalLM
+from model_rotary import FalconRotaryForCausalLM
+
 
 from transformers import (
     AutoModelForCausalLM,
@@ -10,6 +12,32 @@ from transformers import (
 from transformers.utils import logging
 
 import torch
+import time
+from transformers.trainer_utils import set_seed
+
+
+
+def load_falcon_rotary(falcon_config, model_name):
+    model = FalconRotaryForCausalLM.from_pretrained(
+        model_name,
+        config=falcon_config,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+    )
+    print(f"Pretrained falcon model with Rotary: {model}")
+    return model
+
+def load_falcon_alibi(falcon_config, model_name):
+    model = FalconAlibiForCausalLM.from_pretrained(
+        model_name,
+        config=falcon_config,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+    )
+    print(f"Pretrained falcon model with Alibi: {model}")
+    return model
 
 def main():
     logging.set_verbosity_info()
@@ -20,29 +48,70 @@ def main():
 
     # Get local config.json, same as from HF. 
     falcon_config = RWConfig.from_pretrained(pretrained_config_path)
-    # Downloads model weights from HF repo and instanties a model from the local modelling_RW.py
+    
+    # Downloads model weights from HF repo and instanties a model from the local classes
     # TODO Download a specified checkpoint/commit OR download latest pre trained config from HF
-    model = RWForCausalLM.from_pretrained(
-        model_name,
-        config=falcon_config,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        device_map="auto",
-    )
-    print(f"Pretrained falcon model: {model}")
+    model = load_falcon_rotary(falcon_config, model_name)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     print(f"Pre-trained tokenizer: {tokenizer}")
+
+
     
     #simpleinput(model, tokenizer)
-    simplepipe(model,tokenizer)
+    #simplepipe(model,tokenizer)
+    timeinference(model,tokenizer)
+
+
+def timeinference(model,tokenizer):
+    inp2 = "What is the meaning of life?" # the response will fill the entire max_length=200 with set_seed(42)
+    inputs = tokenizer(inp2, return_token_type_ids=False, return_tensors="pt").to("cuda")
+    inp_len = inputs.input_ids.shape[1]
+
+    runs = 30
+    tot_time = 0
+    tokens = 0
+    run_times = list()
+    for i in range(runs):
+        with torch.no_grad():
+            set_seed(42)
+            start_time = time.time()
+            outputs = model.generate(
+                **inputs, 
+                max_length=200,
+                temperature=1.1,
+                repetition_penalty=1.4,
+                early_stopping=True,
+            )
+            elapsed = time.time() - start_time
+        tot_time += elapsed
+        run_times.append(elapsed)
+        tokens += outputs.shape[1] - inp_len
+    
+    avg_time = tot_time/runs
+    print(f"average time over {runs} runs was {avg_time}, it produced {tokens} tokens, which is {tokens/tot_time} tokens/s")
+    print(f"run times: {run_times}")
+        
+
+
+    
 
 def simpleinput(model, tokenizer):
-    inputs = tokenizer("What's the best way to divide a pizza between three people?", return_token_type_ids=False, return_tensors="pt").to("cuda")
-    
-    outputs = model.generate(**inputs, max_length=500, return_dict_in_generate=True)
-
+    inp = "What's the best way to divide a pizza between three people?"
+    inp2 = "What is the meaning of life?"
+    inputs = tokenizer(inp2, return_token_type_ids=False, return_tensors="pt").to("cuda")
+    set_seed(42)
+    outputs = model.generate(
+        **inputs, 
+        max_length=200,
+        temperature=1.1,
+        repetition_penalty=1.4,
+        early_stopping=True,
+        do_sample=True,
+        return_dict_in_generate=True)
+        
+    print(outputs.sequences[0].shape[0])
     decoded = tokenizer.decode(outputs.sequences[0])
     print(decoded)
     """ 
@@ -93,7 +162,7 @@ def simplepipe(model, tokenizer):
     """
 
     sequences = pl(
-        pizza,
+        giff,
         max_length=200,
         do_sample=True,
         top_k=10,
