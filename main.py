@@ -113,7 +113,7 @@ def simplepipe(model, tokenizer):
     """
 
     sequences = pl(
-        pizza,
+        giff,
         max_length=200,
         do_sample=True,
         top_k=10,
