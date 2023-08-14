@@ -128,12 +128,11 @@ class AttentionRotary(nn.Module):
 
         self.query_key_value = Linear(
             self.hidden_size,
-            3 * self.hidden_size if not config.multi_query else (self.hidden_size + 2 * self.head_dim),
+            self.hidden_size + 2 * self.head_dim,
             bias=config.bias,
         )
-        self.multi_query = config.multi_query
         self.dense = Linear(self.hidden_size, self.hidden_size, bias=config.bias)
-        self.num_kv = config.n_head if not self.multi_query else 1
+        self.num_kv = 1
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -147,14 +146,9 @@ class AttentionRotary(nn.Module):
             query: [batch_size, seq_length, num_heads, head_dim] key: [batch_size, seq_length, num_heads, head_dim]
             value: [batch_size, seq_length, num_heads, head_dim]
         """
-        if not self.multi_query:
-            batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-            fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
-            return fused_qkv[..., 0, :], fused_qkv[..., 1, :], fused_qkv[..., 2, :]
-        else:
-            batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-            fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
-            return fused_qkv[..., :-2, :], fused_qkv[..., [-2], :], fused_qkv[..., [-1], :]
+        batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
+        fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
+        return fused_qkv[..., :-2, :], fused_qkv[..., [-2], :], fused_qkv[..., [-1], :]
 
     def forward(
         self,
@@ -219,10 +213,6 @@ class DecoderLayer(nn.Module):
         self.num_heads = config.n_head
         self.self_attention = AttentionRotary(config)
 
-        if not config.parallel_attn:
-            # unused if parallel attn
-            self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-
         self.mlp = MLP(config)
 
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
@@ -248,20 +238,14 @@ class DecoderLayer(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
         )
-
         attention_output = attn_outputs[0]
-
-        if not self.config.parallel_attn:
-            residual = dropout_add(attention_output, residual, self.config.attention_dropout, training=self.training)
-            layernorm_output = self.post_attention_layernorm(residual)
 
         outputs = attn_outputs[1:]
 
         # MLP.
         mlp_output = self.mlp(layernorm_output)
-
-        if self.config.parallel_attn:
-            mlp_output += attention_output
+        
+        mlp_output += attention_output
 
         output = dropout_add(mlp_output, residual, self.config.hidden_dropout, training=self.training)
 
@@ -346,6 +330,12 @@ class RWPreTrainedModel(PreTrainedModel):
 class RWModel(RWPreTrainedModel):
     def __init__(self, config: RWConfig):
         super().__init__(config)
+
+        # due to code modification certain config options are no longer used, ensure that no-one tries different config options
+        assert config.alibi == False, "alibi=True config option has been disabled, see https://github.com/kimborgen/falcon-llm/pull/11"
+        assert config.multi_query == True, "multi_query=False config option has been disabled see https://github.com/kimborgen/falcon-llm/pull/15"
+        assert config.parallel_attn == True, "parallel_attn=False config option has been disabled see https://github.com/kimborgen/falcon-llm/pull/15"
+
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.n_head
