@@ -128,12 +128,11 @@ class AttentionRotary(nn.Module):
 
         self.query_key_value = Linear(
             self.hidden_size,
-            3 * self.hidden_size if not config.multi_query else (self.hidden_size + 2 * self.head_dim),
+            self.hidden_size + 2 * self.head_dim,
             bias=config.bias,
         )
-        self.multi_query = config.multi_query
         self.dense = Linear(self.hidden_size, self.hidden_size, bias=config.bias)
-        self.num_kv = config.n_head if not self.multi_query else 1
+        self.num_kv = 1
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -147,14 +146,9 @@ class AttentionRotary(nn.Module):
             query: [batch_size, seq_length, num_heads, head_dim] key: [batch_size, seq_length, num_heads, head_dim]
             value: [batch_size, seq_length, num_heads, head_dim]
         """
-        if not self.multi_query:
-            batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-            fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
-            return fused_qkv[..., 0, :], fused_qkv[..., 1, :], fused_qkv[..., 2, :]
-        else:
-            batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-            fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
-            return fused_qkv[..., :-2, :], fused_qkv[..., [-2], :], fused_qkv[..., [-1], :]
+        batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
+        fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
+        return fused_qkv[..., :-2, :], fused_qkv[..., [-2], :], fused_qkv[..., [-1], :]
 
     def forward(
         self,
