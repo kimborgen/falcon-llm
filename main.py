@@ -59,9 +59,9 @@ def main():
 
 
     
-    #simpleinput(model, tokenizer)
+    simpleinput(model, tokenizer)
     #simplepipe(model,tokenizer)
-    timeinference(model,tokenizer)
+    #timeinference(model,tokenizer)
 
 
 def timeinference(model,tokenizer):

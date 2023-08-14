@@ -331,6 +331,12 @@ class RWModel(RWPreTrainedModel):
     def __init__(self, config: RWConfig):
         super().__init__(config)
 
+        # due to code modification certain config options are no longer used, ensure that no-one tries different config options
+        assert config.alibi == False, "alibi=True config option has been disabled, see https://github.com/kimborgen/falcon-llm/pull/11"
+        assert config.multi_query == True, "multi_query=False config option has been disabled see https://github.com/kimborgen/falcon-llm/pull/15"
+        assert config.parallel_attn == True, "parallel_attn=False config option has been disabled see https://github.com/kimborgen/falcon-llm/pull/15"
+
+
         self.embed_dim = config.hidden_size
         self.num_heads = config.n_head
         self.alibi = config.alibi
