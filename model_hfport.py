@@ -1,3 +1,20 @@
+# coding=utf-8
+# Copyright 2023 the Falcon authors and HuggingFace Inc. team.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch Falcon model."""
+
+import os
 import math
 import warnings
 from typing import Optional, Tuple, Union
@@ -17,35 +34,104 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
-from configuration_RW import RWConfig
+from configuration_hfport import FalconConfig
 
 logger = logging.get_logger(__name__)
 
 from einops import rearrange
-from modelling_RW_base import Linear, dropout_add, MLP, RWPreTrainedModel
+
+
+logger = logging.get_logger(__name__)
+
+
+# NOTE(Hesslow): Unfortunately we did not fuse matmul and bias during training, this means that there's one additional quantization to bfloat16 between the operations.
+# In order not to degrade the quality of our HF-port, we keep these characteristics in the final model.
+class FalconLinear(nn.Linear):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        hidden_states = input @ self.weight.T
+        if self.bias is None:
+            return hidden_states
+        return hidden_states + self.bias
+
+
+# rotary pos emb helpers (torch.jit.script does not seem to support staticmethod...)
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class FalconRotaryEmbedding(nn.Module):
+    """Implementation of RotaryEmbedding from GPT-NeoX.
+    This implementation is designed to operate on queries and keys that are compatible with `[batch_size,
+    n_heads_per_partition, seq_len, head_dim]` (e.g. MinGPTAttention format).
+    """
+
+    def __init__(self, head_dim: int, base=10000):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.head_dim = head_dim
+        self.seq_len_cached = -1
+        self.cos_cached: torch.Tensor | None = None
+        self.sin_cached: torch.Tensor | None = None
+
+    def cos_sin(self, seq_len: int, past_key_values_length: int, device="cpu", dtype=torch.bfloat16) -> torch.Tensor:
+        total_length = seq_len + past_key_values_length
+        if total_length > self.seq_len_cached:
+            self.seq_len_cached = total_length
+            t = torch.arange(total_length, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1).to(device)
+
+            if dtype in [torch.float16, torch.bfloat16]:
+                emb = emb.float()
+
+            self.cos_cached = emb.cos()[None, :, :]
+            self.sin_cached = emb.sin()[None, :, :]
+
+            self.cos_cached = self.cos_cached.type(dtype)
+            self.sin_cached = self.sin_cached.type(dtype)
+
+        return (
+            self.cos_cached[:, past_key_values_length : seq_len + past_key_values_length],
+            self.sin_cached[:, past_key_values_length : seq_len + past_key_values_length],
+        )
+
+    def forward(self, query, key, past_key_values_length=0):
+        batch, seq_len, head_dim = query.shape
+        cos, sin = self.cos_sin(seq_len, past_key_values_length, query.device, query.dtype)
+        return (query * cos) + (rotate_half(query) * sin), (key * cos) + (rotate_half(key) * sin)
+
 
 def _make_causal_mask(
     input_ids_shape: torch.Size, device: torch.device, past_key_values_length: int
 ) -> torch.BoolTensor:
+    """
+    Make causal mask used for self-attention. This mask does not take the existing attention mask into account - it
+    just blocks tokens from attending forwards in the sequence. The output shape will be `[batch_size, 1,
+    target_length, target_length+past_key_values_length]`.
+    """
     batch_size, target_length = input_ids_shape
-    mask = torch.empty((target_length, target_length + past_key_values_length), dtype=torch.bool, device=device)
-    # ONNX doesn't support `torch.Tensor.triu` properly, thus we use this workaround
-    seq_ids = torch.arange(target_length, device=device)
-    mask[:, past_key_values_length:] = seq_ids[:, None] < seq_ids[None, :]
 
-    if past_key_values_length > 0:
-        mask[:, :past_key_values_length] = False
-
+    mask = torch.triu(torch.ones((target_length, target_length), dtype=torch.bool, device=device), diagonal=1)
+    # If past_key_values_length is 0 this is an empty tensor and the concatenation is a no-op.
+    # This code style is an unfortunate consequence of getting your TF engineer to port models; doing it this
+    # way avoids a data-dependent conditional, which will help me when I have to port this to XLA later.
+    past_mask = torch.zeros((target_length, past_key_values_length), dtype=torch.bool, device=device)
+    mask = torch.cat([past_mask, mask], dim=-1)
     expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
     return expanded_mask
 
 
-def _expand_mask(mask: torch.Tensor, tgt_length: int) -> torch.BoolTensor:
-    batch_size, src_length = mask.shape
-    tgt_length = tgt_length if tgt_length is not None else src_length
+def _expand_mask(mask: torch.Tensor, past_key_values_length: int) -> torch.BoolTensor:
+    """
+    Expands attention_mask from `[batch_size, seq_length]` to `[batch_size, 1, seq_length, seq_length + past_length]`.
+    """
+    batch_size, total_length = mask.shape
+    seq_length = total_length - past_key_values_length if past_key_values_length is not None else total_length
 
     expanded_mask = ~(mask[:, None, None, :].to(torch.bool))
-    return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
+    return expanded_mask.expand(batch_size, 1, seq_length, total_length)
 
 
 def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
@@ -76,12 +162,32 @@ def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torc
     return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
 
 
-class AttentionAlibi(nn.Module):
-    def __init__(self, config: RWConfig):
+# Copied from transformers.models.bloom.modeling_bloom.dropout_add
+def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: bool) -> torch.Tensor:
+    """
+    Dropout add function
+
+    Args:
+        x (`torch.tensor`, *required*):
+            input tensor
+        residual (`torch.tensor`, *required*):
+            residual tensor
+        prob (`float`, *required*):
+            dropout probability
+        training (`bool`, *required*):
+            training mode
+    """
+    out = F.dropout(x, p=prob, training=training)
+    out = residual + out
+    return out
+
+
+class FalconAttention(nn.Module):
+    def __init__(self, config: FalconConfig):
         super().__init__()
 
         self.hidden_size = config.hidden_size
-        self.num_heads = config.n_head
+        self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.split_size = self.hidden_size
         self.hidden_dropout = config.hidden_dropout
@@ -92,25 +198,27 @@ class AttentionAlibi(nn.Module):
                 f" {self.num_heads})."
             )
 
+        self.maybe_rotary = FalconRotaryEmbedding(config.head_dim) if config.rotary else lambda q, k, t: (q, k)
 
         # Layer-wise attention scaling
         self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
         self.beta = self.inv_norm_factor
-
-        self.query_key_value = Linear(
-            self.hidden_size,
-            3 * self.hidden_size if not config.multi_query else (self.hidden_size + 2 * self.head_dim),
-            bias=config.bias,
-        )
+        if config.new_decoder_architecture:
+            qkv_out_dim = (config.num_kv_heads * 2 + config.num_attention_heads) * self.head_dim
+        elif config.multi_query:
+            qkv_out_dim = self.hidden_size + 2 * self.head_dim
+        else:
+            qkv_out_dim = 3 * self.hidden_size
+        self.query_key_value = FalconLinear(self.hidden_size, qkv_out_dim, bias=config.bias)
+        self.new_decoder_architecture = config.new_decoder_architecture
         self.multi_query = config.multi_query
-        self.dense = Linear(self.hidden_size, self.hidden_size, bias=config.bias)
+        self.dense = FalconLinear(self.hidden_size, self.hidden_size, bias=config.bias)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
-        self.num_kv = config.n_head if not self.multi_query else 1
+        self.num_kv_heads = config.num_kv_heads if (self.new_decoder_architecture or not self.multi_query) else 1
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
-        storage as `fused_qkv`
+        Split the last dimension into (num_heads, head_dim), results share same memory storage as `fused_qkv`
 
         Args:
             fused_qkv (`torch.tensor`, *required*): [batch_size, seq_length, num_heads * 3 * head_dim]
@@ -119,7 +227,18 @@ class AttentionAlibi(nn.Module):
             query: [batch_size, seq_length, num_heads, head_dim] key: [batch_size, seq_length, num_heads, head_dim]
             value: [batch_size, seq_length, num_heads, head_dim]
         """
-        if not self.multi_query:
+        if self.new_decoder_architecture:
+            batch, seq_len, _ = fused_qkv.shape
+            qkv = fused_qkv.view(batch, seq_len, -1, self.num_heads // self.num_kv_heads + 2, self.head_dim)
+            query = qkv[:, :, :, :-2]
+            key = qkv[:, :, :, [-2]]
+            value = qkv[:, :, :, [-1]]
+            key = torch.broadcast_to(key, query.shape)
+            value = torch.broadcast_to(value, query.shape)
+
+            query, key, value = [x.flatten(2, 3) for x in (query, key, value)]
+            return query, key, value
+        elif not self.multi_query:
             batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
             fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
             return fused_qkv[..., 0, :], fused_qkv[..., 1, :], fused_qkv[..., 2, :]
@@ -128,12 +247,13 @@ class AttentionAlibi(nn.Module):
             fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
             return fused_qkv[..., :-2, :], fused_qkv[..., [-2], :], fused_qkv[..., [-1], :]
 
+    # Copied from transformers.models.bloom.modeling_bloom.BloomAttention._merge_heads
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Merge heads together over the last dimenstion
+        Merge heads together over the last dimension
 
         Args:
-            x: (`torch.tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
+            x (`torch.tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
 
         Returns:
             torch.tensor: [batch_size, seq_length, num_heads * head_dim]
@@ -156,7 +276,7 @@ class AttentionAlibi(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        alibi: torch.Tensor,
+        alibi: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         head_mask: Optional[torch.Tensor] = None,
@@ -164,131 +284,169 @@ class AttentionAlibi(nn.Module):
         output_attentions: bool = False,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
-
+        num_kv_heads = self.num_heads if self.new_decoder_architecture else self.num_kv_heads
         # 3 x [batch_size, seq_length, num_heads, head_dim]
         (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
 
-        batch_size, q_length, _, _ = query_layer.shape
+        batch_size, query_length, _, _ = query_layer.shape
 
-        query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
+        query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, query_length, self.head_dim)
         key_layer = key_layer.transpose(1, 2).reshape(
-            batch_size * self.num_kv,
-            q_length,
+            batch_size * num_kv_heads,
+            query_length,
             self.head_dim,
         )
-        value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_kv, q_length, self.head_dim)
+        value_layer = value_layer.transpose(1, 2).reshape(batch_size * num_kv_heads, query_length, self.head_dim)
+
+        past_kv_length = 0 if layer_past is None else layer_past[0].shape[1]
+        query_layer, key_layer = self.maybe_rotary(query_layer, key_layer, past_kv_length)
 
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
-            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
+            #  - key: [batch_size * self.num_heads, kv_length, head_dim]
             #  - value: [batch_size * self.num_heads, kv_length, head_dim]
             key_layer = torch.cat((past_key, key_layer), dim=1)
             value_layer = torch.cat((past_value, value_layer), dim=1)
 
         _, kv_length, _ = key_layer.shape
-
-        if use_cache is True:
+        if use_cache:
             present = (key_layer, value_layer)
         else:
             present = None
 
+        attention_mask_float = (attention_mask * 1.0).masked_fill(attention_mask, float("-1e9")).to(query_layer.dtype)
+
+        query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
+        key_layer_ = key_layer.reshape(batch_size, num_kv_heads, -1, self.head_dim)
+        value_layer_ = value_layer.reshape(batch_size, num_kv_heads, -1, self.head_dim)
+
         if alibi is None:
-            query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
-            key_layer_ = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
-            value_layer_ = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+            if output_attentions:
+                # F.scaled_dot_product_attention doesn't return the attention weights, so we have
+                # to do it by hand if we want them
+                attention_scores = query_layer_ @ key_layer_.transpose(-1, -2)
+                attention_scores /= math.sqrt(self.head_dim)
 
-            attn_output = F.scaled_dot_product_attention(
-                query_layer_, key_layer_, value_layer_, None, 0.0, is_causal=True
-            )
+                attention_scores = F.softmax(
+                    attention_scores + attention_mask_float, dim=-1, dtype=hidden_states.dtype
+                )
+                attn_output = attention_scores @ value_layer_
+            else:
+                attn_output = F.scaled_dot_product_attention(
+                    query_layer_, key_layer_, value_layer_, attention_mask_float, 0.0, is_causal=False
+                )
+                attention_scores = None
 
-            x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
-            x = x.permute(0, 2, 1, 3)
-            attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
+            attn_output = attn_output.view(batch_size, self.num_heads, query_length, self.head_dim)
+            attn_output = attn_output.permute(0, 2, 1, 3)
+            attn_output = attn_output.reshape(batch_size, query_length, self.num_heads * self.head_dim)
 
             output_tensor = self.dense(attn_output)
 
-            outputs = (output_tensor, present)
-            assert not output_attentions  # not supported.
-            return outputs
+            if output_attentions:
+                return output_tensor, present, attention_scores
+            else:
+                return output_tensor, present
+
         else:
-            attention_mask_float = (attention_mask * 1.0).masked_fill(attention_mask, -1e9).to(torch.bfloat16)
-            matmul_result = query_layer @ key_layer.transpose(-1, -2)
+            matmul_result = query_layer_ @ key_layer_.transpose(-1, -2)
 
             # change view to [batch_size, num_heads, q_length, kv_length]
-            attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
+            attention_scores = matmul_result.view(batch_size, self.num_heads, query_length, kv_length)
 
             # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
             input_dtype = attention_scores.dtype
             # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
             if input_dtype == torch.float16 or input_dtype == torch.bfloat16:
                 attention_scores = attention_scores.to(torch.float32)
-            # attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
-            attention_probs = F.softmax(
-                (attention_scores + alibi.view(batch_size, self.num_heads, 1, -1)) * self.inv_norm_factor + attention_mask_float,
-                dim=-1,
-                dtype=hidden_states.dtype,
-            )
+            # Matt (HF) note: We could possibly use F.scaled_dot_product_attention here too, by
+            # adding (alibi * self.inv_norm_factor) to attention_mask_float. I think this would be mathematically
+            # equivalent and more performant, but there might be a numerical difference. If you're reading this
+            # and you'd like to experiment and maybe file a PR, feel free!
+            attention_logits = attention_scores + alibi.view(batch_size, self.num_heads, 1, -1)
+            attention_logits *= self.inv_norm_factor
+            attention_probs = F.softmax(attention_logits + attention_mask_float, dim=-1, dtype=hidden_states.dtype)
             # [batch_size, num_heads, q_length, kv_length]
             attention_probs = self.attention_dropout(attention_probs)
 
             if head_mask is not None:
                 attention_probs = attention_probs * head_mask
 
-            # change view [batch_size x num_heads, q_length, kv_length]
-            attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
+            # change view [batch_size, num_heads, q_length, kv_length]
+            attention_probs_reshaped = attention_probs.view(batch_size, self.num_heads, query_length, kv_length)
 
             # matmul: [batch_size * num_heads, q_length, head_dim]
-            context_layer = attention_probs_reshaped @ value_layer
+            context_layer = (attention_probs_reshaped @ value_layer_).flatten(0, 1)
 
-            # change view [batch_size, num_heads, q_length, head_dim]
+            # change view [batch_size, q_length, num_heads * head_dim]
             context_layer = self._merge_heads(context_layer)
 
             output_tensor = self.dense(context_layer)
 
-            outputs = (output_tensor, present)
             if output_attentions:
-                outputs += (attention_probs,)
+                return output_tensor, present, attention_probs
+            else:
+                return output_tensor, present
 
-            return outputs
 
-class DecoderLayer(nn.Module):
-    def __init__(self, config: RWConfig):
+class FalconMLP(nn.Module):
+    def __init__(self, config: FalconConfig):
         super().__init__()
         hidden_size = config.hidden_size
 
-        self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.num_heads = config.n_head
-        self.self_attention = Attention(config)
-
-        if not config.parallel_attn:
-            # unused if parallel attn
-            self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-
-        self.mlp = MLP(config)
-
-        self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
+        self.dense_h_to_4h = FalconLinear(hidden_size, 4 * hidden_size, bias=config.bias)
+        self.act = nn.GELU()
+        self.dense_4h_to_h = FalconLinear(4 * hidden_size, hidden_size, bias=config.bias)
         self.hidden_dropout = config.hidden_dropout
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.dense_h_to_4h(x))
+        x = self.dense_4h_to_h(x)
+        return x
+
+
+class FalconDecoderLayer(nn.Module):
+    def __init__(self, config: FalconConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.self_attention = FalconAttention(config)
+        self.mlp = FalconMLP(config)
+        self.hidden_dropout = config.hidden_dropout
         self.config = config
+
+        if config.new_decoder_architecture:
+            # The layer norm before self-attention
+            self.ln_attn = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+            # The layer norm before the MLP
+            self.ln_mlp = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        else:
+            self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+            if not config.parallel_attn:
+                self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        alibi: torch.Tensor,
+        alibi: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         head_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
     ):
-
-        layernorm_output = self.input_layernorm(hidden_states)
         residual = hidden_states
+
+        if self.config.new_decoder_architecture:
+            attention_layernorm_out = self.ln_attn(hidden_states)
+            mlp_layernorm_out = self.ln_mlp(hidden_states)
+        else:
+            attention_layernorm_out = self.input_layernorm(hidden_states)
 
         # Self attention.
         attn_outputs = self.self_attention(
-            layernorm_output,
+            attention_layernorm_out,
             layer_past=layer_past,
             attention_mask=attention_mask,
             alibi=alibi,
@@ -299,16 +457,21 @@ class DecoderLayer(nn.Module):
 
         attention_output = attn_outputs[0]
 
-        if not self.config.parallel_attn:
-            residual = dropout_add(attention_output, residual, self.config.attention_dropout, training=self.training)
-            layernorm_output = self.post_attention_layernorm(residual)
+        if not self.config.new_decoder_architecture:
+            if self.config.parallel_attn:
+                mlp_layernorm_out = attention_layernorm_out
+            else:
+                residual = dropout_add(
+                    attention_output, residual, self.config.attention_dropout, training=self.training
+                )
+                mlp_layernorm_out = self.post_attention_layernorm(residual)
 
         outputs = attn_outputs[1:]
 
         # MLP.
-        mlp_output = self.mlp(layernorm_output)
+        mlp_output = self.mlp(mlp_layernorm_out)
 
-        if self.config.parallel_attn:
+        if self.config.new_decoder_architecture or self.config.parallel_attn:
             mlp_output += attention_output
 
         output = dropout_add(mlp_output, residual, self.config.hidden_dropout, training=self.training)
@@ -320,24 +483,23 @@ class DecoderLayer(nn.Module):
 
         return outputs  # hidden_states, present, attentions
 
-class RWPreTrainedModel(PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
+class FalconPreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
 
-    config_class = RWConfig
+    config_class = FalconConfig
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["DecoderLayer"]
+    _no_split_modules = ["FalconDecoderLayer"]
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
 
     def _init_weights(self, module: nn.Module):
         """Initialize the weights."""
-        if isinstance(module, nn.Linear) or isinstance(module, Linear):
+        if isinstance(module, nn.Linear) or isinstance(module, FalconLinear):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
@@ -351,26 +513,28 @@ class RWPreTrainedModel(PreTrainedModel):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
+    # Copied from transformers.models.bloom.modeling_bloom.BloomPreTrainedModel._set_gradient_checkpointing with BloomModel->FalconModel
     def _set_gradient_checkpointing(self, module: nn.Module, value: bool = False):
-        if isinstance(module, RWModel):
+        if isinstance(module, FalconModel):
             module.gradient_checkpointing = value
 
     @staticmethod
-    def _convert_to_standard_cache(
+    def _convert_cache_to_standard_format(
         past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]], batch_size: int
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Standardizes the format of the cache so as to match most implementations, i.e. to tuple(tuple([batch_size,
         num_heads, ...]))
         """
-        batch_size_times_num_heads, head_dim, seq_length = past_key_value[0][0].shape
+        batch_size_times_num_heads, kv_length, head_dim = past_key_value[0][0].shape
+        # [batch_size * self.num_heads, kv_length, head_dim] -> [batch_size, num_heads, kv_length, head_dim]
+        # Note that don't want to use self.num_attention_heads because the number of heads may vary depending
+        # on whether we use multi_query attention.
         num_heads = batch_size_times_num_heads // batch_size
-        # key: [batch_size * num_heads, head_dim, seq_length] -> [batch_size, num_heads, head_dim, seq_length]
-        # value: [batch_size * num_heads, seq_length, head_dim] -> [batch_size, num_heads, seq_length, head_dim]
         return tuple(
             (
-                layer_past[0].view(batch_size, num_heads, head_dim, seq_length),
-                layer_past[1].view(batch_size, num_heads, seq_length, head_dim),
+                layer_past[0].view(batch_size, num_heads, kv_length, head_dim),
+                layer_past[1].view(batch_size, num_heads, kv_length, head_dim),
             )
             for layer_past in past_key_value
         )
@@ -379,33 +543,31 @@ class RWPreTrainedModel(PreTrainedModel):
     def _convert_to_rw_cache(
         past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]]
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor]]:
-        batch_size, num_heads, head_dim, seq_length = past_key_value[0][0].shape
+        batch_size, num_heads, kv_length, head_dim = past_key_value[0][0].shape
         batch_size_times_num_heads = batch_size * num_heads
-        # key:  [batch_size, num_heads, head_dim, seq_length] -> [batch_size * num_heads, head_dim, seq_length]
-        # value: [batch_size, num_heads, seq_length, head_dim] -> [batch_size * num_heads, seq_length, head_dim]
+        # [batch_size, num_heads, kv_length, head_dim] -> [batch_size * num_heads, kv_length, head_dim]
         return tuple(
             (
-                layer_past[0].view(batch_size_times_num_heads, head_dim, seq_length),
-                layer_past[1].view(batch_size_times_num_heads, seq_length, head_dim),
+                layer_past[0].view(batch_size_times_num_heads, kv_length, head_dim),
+                layer_past[1].view(batch_size_times_num_heads, kv_length, head_dim),
             )
             for layer_past in past_key_value
         )
 
 
-
-class RWModel(RWPreTrainedModel):
-    def __init__(self, config: RWConfig):
+class FalconModel(FalconPreTrainedModel):
+    def __init__(self, config: FalconConfig):
         super().__init__(config)
 
         self.embed_dim = config.hidden_size
-        self.num_heads = config.n_head
-        self.alibi = config.alibi
+        self.num_heads = config.num_attention_heads
+        self.use_alibi = config.alibi
 
         # Embedding + LN Embedding
         self.word_embeddings = nn.Embedding(config.vocab_size, self.embed_dim)
 
         # Transformer blocks
-        self.h = nn.ModuleList([DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([FalconDecoderLayer(config) for _ in range(config.num_hidden_layers)])
 
         # Final Layer Norm
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
@@ -418,22 +580,31 @@ class RWModel(RWPreTrainedModel):
     def get_input_embeddings(self):
         return self.word_embeddings
 
+    @staticmethod
     def _prepare_attn_mask(
-        self, attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
+        attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
     ) -> torch.BoolTensor:
-        # create causal mask
-        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        # Create a causal mask
+        # The attention mask we receive as input should cover the whole extended sequence, including any past
+        # cache, so its shape should be [batch_size, seq_length + past_key_values_length]
+        # The output shape will be [batch_size, 1, seq_length, seq_length + past_key_values_length]
+        if input_shape[1] + past_key_values_length != attention_mask.shape[1]:
+            raise ValueError(
+                "Attention mask shape should be (batch_size, seq_length + past_key_values_length)"
+                f" but is {attention_mask.shape} with input_ids shape {input_shape} and past length"
+                f" {past_key_values_length}."
+            )
         combined_attention_mask = None
         device = attention_mask.device
-        _, src_length = input_shape
+        _, seq_length = input_shape
 
-        if src_length > 1:
+        if seq_length > 1:
             combined_attention_mask = _make_causal_mask(
                 input_shape, device=device, past_key_values_length=past_key_values_length
             )
 
-        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
-        expanded_attn_mask = _expand_mask(attention_mask, tgt_length=src_length)
+        # [batch_size, seq_length + past_key_values_length] -> [batch_size, 1, seq_length, seq_length + past_key_values_length]
+        expanded_attn_mask = _expand_mask(attention_mask, past_key_values_length=past_key_values_length)
         combined_attention_mask = (
             expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
         )
@@ -454,18 +625,7 @@ class RWModel(RWPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
-        if deprecated_arguments.pop("position_ids", False) is not False:
-            # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
-            warnings.warn(
-                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
-                " passing `position_ids`.",
-                FutureWarning,
-            )
-        if len(deprecated_arguments) > 0:
-            raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -484,12 +644,14 @@ class RWModel(RWPreTrainedModel):
 
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
+        else:
+            past_key_values = self._convert_to_rw_cache(past_key_values)
 
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
         # attention_probs has shape batch_size x num_heads x N x N
         # head_mask has shape n_layer x batch x num_heads x N x N
-        head_mask = self.get_head_mask(head_mask, self.config.n_layer)
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
@@ -501,17 +663,15 @@ class RWModel(RWPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
 
         # Compute alibi tensor: check build_alibi_tensor documentation
-        seq_length_with_past = seq_length
         past_key_values_length = 0
         if past_key_values[0] is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
+            past_key_values_length = past_key_values[0][0].shape[1]  # 1 because RW-cache, not standard format
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
+            attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=hidden_states.device)
         else:
             attention_mask = attention_mask.to(hidden_states.device)
 
-        if self.alibi:
+        if self.use_alibi:
             alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
         else:
             alibi = None
@@ -523,12 +683,10 @@ class RWModel(RWPreTrainedModel):
         )
 
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-
                 if use_cache:
                     logger.warning(
                         "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -573,6 +731,9 @@ class RWModel(RWPreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
+        if presents is not None:
+            presents = self._convert_cache_to_standard_format(presents, batch_size)
+
         if not return_dict:
             return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
 
@@ -584,12 +745,12 @@ class RWModel(RWPreTrainedModel):
         )
 
 
-class FalconAlibiForCausalLM(RWPreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
+class FalconForCausalLM(FalconPreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config: RWConfig):
+    def __init__(self, config: FalconConfig):
         super().__init__(config)
-        self.transformer = RWModel(config)
+        self.transformer = FalconModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -604,21 +765,17 @@ class FalconAlibiForCausalLM(RWPreTrainedModel):
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor,
-        past: Optional[torch.Tensor] = None,
+        past_key_values: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict:
-        # only last token for input_ids if past is not None
-        if past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
 
-            # the cache may be in the stardard format (e.g. in contrastive search), convert to our's format if needed
-            if past[0][0].shape[0] == input_ids.shape[0]:
-                past = self._convert_to_rw_cache(past)
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
 
         return {
             "input_ids": input_ids,
-            "past_key_values": past,
+            "past_key_values": past_key_values,
             "use_cache": kwargs.get("use_cache"),
             "attention_mask": attention_mask,
         }
@@ -635,7 +792,6 @@ class FalconAlibiForCausalLM(RWPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -643,15 +799,6 @@ class FalconAlibiForCausalLM(RWPreTrainedModel):
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
-        if deprecated_arguments.pop("position_ids", False) is not False:
-            # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
-            warnings.warn(
-                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
-                " passing `position_ids`.",
-                FutureWarning,
-            )
-        if len(deprecated_arguments) > 0:
-            raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -704,7 +851,6 @@ class FalconAlibiForCausalLM(RWPreTrainedModel):
 
         Output shares the same memory storage as `past`.
         """
-        standardized_past = self._convert_to_standard_cache(past, batch_size=len(beam_idx))
 
         # Get a copy of `beam_idx` on all the devices where we need those indices.
         device_to_beam_idx = {
@@ -715,8 +861,7 @@ class FalconAlibiForCausalLM(RWPreTrainedModel):
                 layer_past[0].index_select(0, device_to_beam_idx[layer_past[0].device]),
                 layer_past[1].index_select(0, device_to_beam_idx[layer_past[0].device]),
             )
-            for layer_past in standardized_past
+            for layer_past in past
         )
-        return self._convert_to_rw_cache(reordered_past)
-
+        return reordered_past
 
